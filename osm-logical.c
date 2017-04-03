@@ -1,3 +1,9 @@
+/* OSM Logical Replication
+ *
+ * Copyright 2017 Matt Amos <zerebubuth@gmail.com>
+ * Released under the Apache-2.0 license. Please see LICENSE.md for details.
+ */
+
 #include "postgres.h"
 
 #include "replication/output_plugin.h"
