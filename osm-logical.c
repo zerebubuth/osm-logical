@@ -83,8 +83,11 @@ static Datum get_attribute_by_name(
   int i;
 
   for (i = 0; i < desc->natts; i++) {
-    //if (strcmp(NameStr(desc->attrs[i]->attname), name) == 0) { // PG9 needs this
-    if (strcmp(NameStr(desc->attrs[i].attname), name) == 0) { // PG11 needs this
+#if PG_VERSION_NUM < 110000
+    if (strcmp(NameStr(desc->attrs[i]->attname), name) == 0) {
+#else
+    if (strcmp(NameStr(desc->attrs[i].attname), name) == 0) {
+#endif
       return heap_getattr(tuple, i + 1, desc, is_null);
     }
   }
