@@ -6,8 +6,13 @@
 
 #include "postgres.h"
 
-#include "replication/output_plugin.h"
+#include "catalog/pg_type.h"
+
 #include "replication/logical.h"
+#include "replication/origin.h"
+#include "replication/output_plugin.h"
+
+#include "utils/rel.h"
 
 #include <inttypes.h>
 
@@ -39,11 +44,6 @@ static void commit(
 void _PG_init(void) {
 }
 
-static void startup(
-  LogicalDecodingContext *ctx,
-  OutputPluginOptions *opt,
-  bool is_init);
-
 void _PG_output_plugin_init(OutputPluginCallbacks *cb) {
   AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
 
@@ -66,7 +66,7 @@ void begin(
   ReorderBufferTXN *txn) {
 
   OutputPluginPrepareWrite(ctx, true);
-  appendStringInfoString(ctx->out, "BEGIN");
+  appendStringInfoString(ctx->out, "B");
   OutputPluginWrite(ctx, true);
 }
 
@@ -83,18 +83,17 @@ static Datum get_attribute_by_name(
   int i;
 
   for (i = 0; i < desc->natts; i++) {
+#if PG_VERSION_NUM < 110000
     if (strcmp(NameStr(desc->attrs[i]->attname), name) == 0) {
-      break;
+#else
+    if (strcmp(NameStr(desc->attrs[i].attname), name) == 0) {
+#endif
+      return heap_getattr(tuple, i + 1, desc, is_null);
     }
   }
 
-  if (i < desc->natts) {
-    return heap_getattr(tuple, i + 1, desc, is_null);
-
-  } else {
-    *is_null = true;
-    return (Datum) NULL;
-  }
+  *is_null = true;
+  return (Datum) NULL;
 }
 
 void change(
@@ -105,64 +104,93 @@ void change(
 
   Form_pg_class form;
   TupleDesc desc;
-  bool is_null_id, is_null_version, is_null_redaction;
-  bool is_node, is_way, is_relation;
-  Datum id, version, redaction;
+  bool is_null_id = false;
+  bool is_null_version = false;
+  bool is_null_cid = false;
+  bool is_null_redaction = false;
+  Datum id, version, cid, redaction;
   const char *table_name;
   HeapTuple tuple;
+  char *id_name;
+  char table_type;
 
   form = RelationGetForm(rel);
-  desc = RelationGetDescr(rel);
   table_name = NameStr(form->relname);
 
-  is_node = strncmp(table_name, "nodes", 6) == 0;
-  is_way = strncmp(table_name, "ways", 5) == 0;
-  is_relation = strncmp(table_name, "relations", 10) == 0;
+  // Which table is this about? Ignore all changes for tables other than
+  // the OSM object tables.
+  if (strncmp(table_name, "nodes", 6) == 0) {
+    table_type = 'n';
+    id_name = "node_id";
+  } else if (strncmp(table_name, "ways", 5) == 0) {
+    table_type = 'w';
+    id_name = "way_id";
+  } else if (strncmp(table_name, "relations", 10) == 0) {
+    table_type = 'r';
+    id_name = "relation_id";
+  } else {
+    return;
+  }
 
-  if (is_node || is_way || is_relation) {
-    const char *id_name =
-      is_node ? "node_id" :
-      is_way ? "way_id" :
-      "relation_id";
+  // Paranoia check.
+  if (change->data.tp.newtuple == NULL) {
+    OutputPluginPrepareWrite(ctx, true);
+    appendStringInfoString(ctx->out, "X newtuple is NULL");
+    OutputPluginWrite(ctx, true);
+    return;
+  }
 
-    tuple = &change->data.tp.newtuple->tuple;
-    id = get_attribute_by_name(tuple, desc, id_name, &is_null_id);
-    version = get_attribute_by_name(tuple, desc, "version", &is_null_version);
+  // Get object id and version.
+  desc = RelationGetDescr(rel);
+  tuple = &change->data.tp.newtuple->tuple;
+  id = get_attribute_by_name(tuple, desc, id_name, &is_null_id);
+  version = get_attribute_by_name(tuple, desc, "version", &is_null_version);
+  cid = get_attribute_by_name(tuple, desc, "changeset_id", &is_null_cid);
+
+  // Paranoia check.
+  if (is_null_id || is_null_version || is_null_cid) {
+    OutputPluginPrepareWrite(ctx, true);
+    appendStringInfoString(ctx->out, "X NULL id or version");
+    OutputPluginWrite(ctx, true);
+    return;
+  }
+
+  // New version of an OSM object.
+  if (change->action == REORDER_BUFFER_CHANGE_INSERT) {
+    OutputPluginPrepareWrite(ctx, true);
+    appendStringInfo(ctx->out, "N %c", table_type);
+    append_bigint(ctx->out, id);
+    appendStringInfoString(ctx->out, " v");
+    append_bigint(ctx->out, version);
+    appendStringInfoString(ctx->out, " c");
+    append_bigint(ctx->out, cid);
+    OutputPluginWrite(ctx, true);
+    return;
+  }
+
+  // Updated element with redaction_id
+  if (change->action == REORDER_BUFFER_CHANGE_UPDATE) {
     redaction = get_attribute_by_name(tuple, desc, "redaction_id", &is_null_redaction);
-
-    if (is_null_id || is_null_version) {
-      // uh, what? this shouldn't happen.
-      // TODO: put some logging in here.
-
-    } else {
-      // new element
-      if (change->action == REORDER_BUFFER_CHANGE_INSERT) {
-        OutputPluginPrepareWrite(ctx, true);
-        appendStringInfoString(ctx->out, "NEW ");
-        appendStringInfoString(ctx->out, table_name);
-        appendStringInfoString(ctx->out, " ");
-        append_bigint(ctx->out, id);
-        appendStringInfoString(ctx->out, " ");
-        append_bigint(ctx->out, version);
-        OutputPluginWrite(ctx, true);
-
-      }
-      // updated element with redaction
-      // TODO: do we ever _unredact_ objects?
-      else if ((change->action == REORDER_BUFFER_CHANGE_UPDATE) &&
-               (!is_null_redaction)) {
-        OutputPluginPrepareWrite(ctx, true);
-        appendStringInfoString(ctx->out, "REDACT ");
-        appendStringInfoString(ctx->out, table_name);
-        appendStringInfoString(ctx->out, " ");
-        append_bigint(ctx->out, id);
-        appendStringInfoString(ctx->out, " ");
-        append_bigint(ctx->out, version);
-        appendStringInfoString(ctx->out, " ");
-        append_bigint(ctx->out, redaction);
-        OutputPluginWrite(ctx, true);
-      }
+    OutputPluginPrepareWrite(ctx, true);
+    if (is_null_redaction) {
+      appendStringInfo(ctx->out, "UPDATE with redaction_id set to NULL for %c", table_type);
+      append_bigint(ctx->out, id);
+      appendStringInfoString(ctx->out, " v");
+      append_bigint(ctx->out, version);
+      appendStringInfoString(ctx->out, " c");
+      append_bigint(ctx->out, cid);
+      OutputPluginWrite(ctx, true);
+      return;
     }
+    appendStringInfo(ctx->out, "R %c", table_type);
+    append_bigint(ctx->out, id);
+    appendStringInfoString(ctx->out, " v");
+    append_bigint(ctx->out, version);
+    appendStringInfoString(ctx->out, " c");
+    append_bigint(ctx->out, cid);
+    appendStringInfoString(ctx->out, " ");
+    append_bigint(ctx->out, redaction);
+    OutputPluginWrite(ctx, true);
   }
 }
 
@@ -172,6 +200,7 @@ void commit(
   XLogRecPtr commit_lsn) {
 
   OutputPluginPrepareWrite(ctx, true);
-  appendStringInfoString(ctx->out, "COMMIT");
+  appendStringInfoString(ctx->out, "C");
   OutputPluginWrite(ctx, true);
 }
+
