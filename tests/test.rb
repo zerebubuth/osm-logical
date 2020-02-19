@@ -44,8 +44,8 @@ SQL
 
   res = conn.exec("SELECT * FROM pg_logical_slot_get_changes('replication_slot', NULL, NULL)")
   logical_data = res.map {|row| row['data']}
-  expected = ['BEGIN', 'NEW nodes 1 1', 'NEW nodes 2 1', 'NEW nodes 3 2',
-              'NEW nodes 4 1', 'COMMIT']
+  expected = ['B', 'N n1 v1 c1', 'N n2 v1 c1', 'N n3 v2 c2',
+              'N n4 v1 c4', 'C']
   unless logical_data == expected
     raise Exception.new("Expected #{expected.inspect}, but got #{logical_data.inspect}")
   end
